@@ -285,6 +285,40 @@ func openTracepointPerfEvent(tid uint64, pid int) (*sys.FD, error) {
 	return sys.NewFD(fd)
 }
 
+// multiLink wraps multiple Links into one. Used for system-wide uprobes that
+// need one perf event per CPU (pid=-1 with cpu=N per event).
+type multiLink struct {
+	links []Link
+}
+
+func (ml *multiLink) isLink() {}
+
+func (ml *multiLink) Close() error {
+	var firstErr error
+	for _, l := range ml.links {
+		if err := l.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (ml *multiLink) Pin(string) error {
+	return fmt.Errorf("multi-cpu link pin: %w", ErrNotSupported)
+}
+
+func (ml *multiLink) Unpin() error {
+	return fmt.Errorf("multi-cpu link unpin: %w", ErrNotSupported)
+}
+
+func (ml *multiLink) Update(_ *ebpf.Program) error {
+	return fmt.Errorf("multi-cpu link update: %w", ErrNotSupported)
+}
+
+func (ml *multiLink) Info() (*Info, error) {
+	return nil, fmt.Errorf("multi-cpu link info: %w", ErrNotSupported)
+}
+
 // Probe BPF perf link.
 //
 // https://elixir.bootlin.com/linux/v5.16.8/source/kernel/bpf/syscall.c#L4307

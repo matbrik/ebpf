@@ -10,6 +10,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/internal"
 	"github.com/cilium/ebpf/internal/tracefs"
+	"github.com/cilium/ebpf/internal/unix"
 )
 
 var (
@@ -222,6 +223,13 @@ func (ex *Executable) address(symbol string, opts *UprobeOptions) (uint64, error
 // Functions provided by shared libraries can currently not be traced and
 // will result in an ErrNotSupported.
 func (ex *Executable) Uprobe(symbol string, prog *ebpf.Program, opts *UprobeOptions) (Link, error) {
+	// System-wide uprobes (PID==0 → perfAllThreads==-1) need one perf event per
+	// CPU. A single perf_event_open with cpu=0 only fires for code executing on
+	// CPU 0, missing all other cores on a multi-core device.
+	if opts == nil || opts.PID == 0 {
+		return ex.uprobeAllCPUs(symbol, prog, opts, false)
+	}
+
 	u, err := ex.uprobe(symbol, prog, opts, false)
 	if err != nil {
 		return nil, err
@@ -256,6 +264,10 @@ func (ex *Executable) Uprobe(symbol string, prog *ebpf.Program, opts *UprobeOpti
 // Functions provided by shared libraries can currently not be traced and
 // will result in an ErrNotSupported.
 func (ex *Executable) Uretprobe(symbol string, prog *ebpf.Program, opts *UprobeOptions) (Link, error) {
+	if opts == nil || opts.PID == 0 {
+		return ex.uprobeAllCPUs(symbol, prog, opts, true)
+	}
+
 	u, err := ex.uprobe(symbol, prog, opts, true)
 	if err != nil {
 		return nil, err
@@ -268,6 +280,96 @@ func (ex *Executable) Uretprobe(symbol string, prog *ebpf.Program, opts *UprobeO
 	}
 
 	return lnk, nil
+}
+
+// uprobeAllCPUs attaches a system-wide uprobe on all online CPUs.
+// perf_event_open with pid=-1 and cpu=N only fires for code executing on CPU N,
+// so we must open one perf event per online CPU and attach the program to each.
+func (ex *Executable) uprobeAllCPUs(symbol string, prog *ebpf.Program, opts *UprobeOptions, ret bool) (Link, error) {
+	if prog == nil {
+		return nil, fmt.Errorf("prog cannot be nil: %w", errInvalidInput)
+	}
+	if prog.Type() != ebpf.Kprobe {
+		return nil, fmt.Errorf("eBPF program type %s is not Kprobe: %w", prog.Type(), errInvalidInput)
+	}
+	if opts == nil {
+		opts = &UprobeOptions{}
+	}
+
+	offset, err := ex.address(symbol, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	if opts.RefCtrOffset != 0 {
+		if err := haveRefCtrOffsetPMU(); err != nil {
+			return nil, fmt.Errorf("uprobe ref_ctr_offset: %w", err)
+		}
+	}
+
+	args := tracefs.ProbeArgs{
+		Type:         tracefs.Uprobe,
+		Symbol:       symbol,
+		Path:         opts.RealFilePath,
+		Offset:       offset,
+		Pid:          perfAllThreads,
+		RefCtrOffset: opts.RefCtrOffset,
+		Ret:          ret,
+		Cookie:       opts.Cookie,
+		Group:        opts.TraceFSPrefix,
+	}
+
+	nCPU, err := internal.PossibleCPUs()
+	if err != nil {
+		return nil, fmt.Errorf("possible CPUs: %w", err)
+	}
+
+	var links []Link
+	for cpu := 0; cpu < nCPU; cpu++ {
+		pe, err := pmuProbeOnCPU(args, cpu)
+		if err != nil {
+			if errors.Is(err, ErrNotSupported) {
+				// PMU not available — close any already-opened links and fall
+				// back to a single tracefs-based perf event (cpu=0 only).
+				closeAll(links)
+				tp, ferr := tracefsProbe(args)
+				if ferr != nil {
+					return nil, fmt.Errorf("creating trace event '%s:%s' in tracefs: %w", ex.path, symbol, ferr)
+				}
+				lnk, ferr := attachPerfEvent(tp, prog, opts.cookie())
+				if ferr != nil {
+					tp.Close()
+					return nil, ferr
+				}
+				return lnk, nil
+			}
+			// EINVAL from PerfEventOpen typically means the CPU is offline; skip it.
+			if errors.Is(err, unix.EINVAL) {
+				continue
+			}
+			closeAll(links)
+			return nil, fmt.Errorf("cpu %d: creating perf_uprobe PMU: %w", cpu, err)
+		}
+		lnk, err := attachPerfEvent(pe, prog, opts.cookie())
+		if err != nil {
+			pe.Close()
+			closeAll(links)
+			return nil, fmt.Errorf("cpu %d: attaching uprobe: %w", cpu, err)
+		}
+		links = append(links, lnk)
+	}
+
+	if len(links) == 0 {
+		return nil, fmt.Errorf("no online CPUs found for uprobe %s:%s", ex.path, symbol)
+	}
+
+	return &multiLink{links}, nil
+}
+
+func closeAll(links []Link) {
+	for _, l := range links {
+		_ = l.Close()
+	}
 }
 
 // uprobe opens a perf event for the given binary/symbol and attaches prog to it.

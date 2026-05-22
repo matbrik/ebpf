@@ -193,7 +193,7 @@ func kprobe(symbol string, prog *ebpf.Program, opts *KprobeOptions, ret bool) (*
 	return tp, nil
 }
 
-// pmuProbe opens a perf event based on a Performance Monitoring Unit.
+// pmuProbe opens a perf event based on a Performance Monitoring Unit on CPU 0.
 //
 // Requires at least a 4.17 kernel.
 // e12f03d7031a "perf/core: Implement the 'perf_kprobe' PMU"
@@ -201,6 +201,13 @@ func kprobe(symbol string, prog *ebpf.Program, opts *KprobeOptions, ret bool) (*
 //
 // Returns ErrNotSupported if the kernel doesn't support perf_[k,u]probe PMU
 func pmuProbe(args tracefs.ProbeArgs) (*perfEvent, error) {
+	return pmuProbeOnCPU(args, 0)
+}
+
+// pmuProbeOnCPU opens a perf event based on a Performance Monitoring Unit on
+// a specific CPU. cpu must be a valid online CPU index, or 0 for process-specific
+// probes (when args.Pid != perfAllThreads).
+func pmuProbeOnCPU(args tracefs.ProbeArgs, cpu int) (*perfEvent, error) {
 	// Getting the PMU type will fail if the kernel doesn't support
 	// the perf_[k,u]probe PMU.
 	eventType, err := internal.ReadUint64FromFileOnce("%d\n", "/sys/bus/event_source/devices", args.Type.String(), "type")
@@ -275,7 +282,7 @@ func pmuProbe(args tracefs.ProbeArgs) (*perfEvent, error) {
 
 	}
 
-	rawFd, err := unix.PerfEventOpen(&attr, args.Pid, 0, -1, unix.PERF_FLAG_FD_CLOEXEC)
+	rawFd, err := unix.PerfEventOpen(&attr, args.Pid, cpu, -1, unix.PERF_FLAG_FD_CLOEXEC)
 
 	// On some old kernels, kprobe PMU doesn't allow `.` in symbol names and
 	// return -EINVAL. Return ErrNotSupported to allow falling back to tracefs.
